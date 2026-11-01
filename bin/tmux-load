@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""tmux-load: recreate tmux windows from tmux-save JSON and resume AI sessions.
+
+Skips existing windows unless --resume-existing is used to resume idle shells.
+Restores parked_windows into the target session's detached parking lot.
+
+Usage:
+  tmux-load [--file PATH] [--session NAME] [--dry-run] [--resume-existing]
+
+Examples:
+  tmux-load                        # restore into current tmux session
+  tmux-load --session 0 --dry-run  # show what would be done
+  tmux-load --file ~/.tmux-ai-sessions.json --session 0
+"""
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+
+from tmux_ai import idle_shell, recover_pane
+from tmux_parking import parking_name
+
+DEFAULT_FILE = os.path.expanduser("~/.tmux-ai-sessions.json")
+
+
+def run_tmux(args, check=True):
+    out = subprocess.run(["tmux"] + args, capture_output=True, text=True, check=False)
+    if check and out.returncode != 0:
+        raise RuntimeError(f"tmux {' '.join(args)} failed: {out.stderr.strip()}")
+    return out
+
+
+def has_session(name):
+    out = run_tmux(["has-session", "-t", "=" + name], check=False)
+    return out.returncode == 0
+
+
+def existing_window_names(session):
+    out = run_tmux(["list-windows", "-t", session, "-F", "#{window_name}"], check=False)
+    if out.returncode != 0:
+        return set()
+    return set(out.stdout.strip().splitlines())
+
+
+def current_session():
+    out = run_tmux(["display-message", "-p", "#S"])
+    return out.stdout.strip()
+
+
+def resume_command(pane):
+    tool = pane.get("tool", "shell")
+    sid = pane.get("ai_session")
+    if tool == "opencode":
+        return shlex.join(["opencode", "--session", sid]) if sid else "opencode"
+    if tool == "claude":
+        return shlex.join(["claude", "--resume", sid]) if sid else "claude --resume"
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--file", default=DEFAULT_FILE)
+    ap.add_argument("--session", default=None, help="target tmux session (default: current or saved name)")
+    ap.add_argument("--dry-run", action="store_true", help="print actions without executing")
+    ap.add_argument("--resume-existing", action="store_true",
+                    help="also resume saved AI sessions in matching existing idle shell panes")
+    args = ap.parse_args()
+
+    path = os.path.expanduser(args.file)
+    if not os.path.exists(path):
+        print(f"error: save file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    with open(path) as f:
+        data = json.load(f)
+
+    saved_session = data.get("tmux_session", "0")
+    try:
+        fallback = current_session()
+    except Exception:
+        fallback = saved_session
+    target = args.session or fallback
+
+    windows = sorted(data.get("windows", []), key=lambda w: w.get("index", 0))
+    parked = sorted(data.get("parked_windows", []), key=lambda w: w.get("index", 0))
+    for window in windows + parked:
+        for i, pane in enumerate(window.get("panes", [])):
+            fixed = recover_pane(pane)
+            if fixed != pane:
+                print(f"recovered {window['name']} pane{pane.get('index', i)}: "
+                      f"{fixed['tool']} {fixed.get('ai_session')} ({fixed.get('method')})")
+            window["panes"][i] = fixed
+    if not windows and not parked:
+        print("nothing to restore (no windows in save file)")
+        return
+
+    # Resolve aliases/IDs so the parking lot belongs to the actual target name.
+    if has_session(target):
+        target = run_tmux(["display-message", "-p", "-t", target, "#{session_name}"]).stdout.strip()
+    lot = parking_name(target)
+    # Respect windows already running, even if moved since the snapshot.
+    visible_names = existing_window_names(target)
+    parked_names = existing_window_names("=" + lot)
+    restore([w for w in windows if w["name"] not in parked_names], target, args.dry_run, args.resume_existing)
+    restore([w for w in parked if w["name"] not in visible_names], lot, args.dry_run, args.resume_existing)
+    print("done." + (" (dry-run, nothing executed)" if args.dry_run else ""))
+
+
+def restore(windows, target, dry_run, resume_existing=False):
+    if not windows:
+        return
+
+    def do(cmd_args, describe):
+        print(f"$ tmux {shlex.join(cmd_args)}   # {describe}")
+        if not dry_run:
+            out = run_tmux(cmd_args)
+            return out.stdout.strip()
+        return ""
+
+    shell = run_tmux(["show-options", "-gv", "default-shell"], check=False).stdout.strip()
+    shell = shell or os.environ.get("SHELL", "/bin/sh")
+
+    def launch(pane):
+        cmd = resume_command(pane)
+        if not cmd:
+            return []
+        # Run after shell initialization, rather than racing it with send-keys.
+        # Keep a normal shell available when the AI client exits.
+        return [shell, "-ic", f"{cmd}; exec {shlex.quote(shell)} -l"]
+
+    session_exists = has_session(target)
+    existing = {}
+    if session_exists:
+        raw = run_tmux(["list-windows", "-t", "=" + target,
+                        "-F", "#{window_id}\t#{window_name}"]).stdout
+        existing = {name: wid for wid, name in (line.split("\t", 1) for line in raw.splitlines())}
+
+    for w in windows:
+        panes = sorted(w.get("panes", []), key=lambda p: p.get("index", 0))
+        if not panes:
+            continue
+        if w["name"] in existing:
+            if not resume_existing:
+                print(f"skip window '{w['name']}' (already exists; use --resume-existing for idle panes)")
+                continue
+            raw = run_tmux(["list-panes", "-t", existing[w["name"]], "-F",
+                            "#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}"]).stdout
+            live = {int(fields[0]): fields[1:] for fields in
+                    (line.split("\t", 4) for line in raw.splitlines())}
+            for pane in panes:
+                cmd = resume_command(pane)
+                current = live.get(pane.get("index", 0))
+                if not cmd or not current:
+                    continue
+                pane_id, pid, command, path = current
+                if not idle_shell(pid, command) or os.path.realpath(path) != os.path.realpath(pane["path"]):
+                    print(f"skip {w['name']} {pane_id} (busy or directory changed)")
+                    continue
+                do(["send-keys", "-t", pane_id, "-l", cmd], f"resume {w['name']} {pane_id}")
+                do(["send-keys", "-t", pane_id, "C-m"], "enter")
+            continue
+        first_pane = panes[0]
+        if session_exists:
+            create = ["new-window", "-d", "-t", f"{target}:"]
+        else:
+            create = ["new-session", "-d", "-s", target]
+        out = do(create + ["-n", w["name"], "-c", first_pane["path"],
+                           "-P", "-F", "#{window_id} #{pane_id}"] + launch(first_pane),
+                 f"create {w['name']} and start its saved session")
+        win_id, pane_id = out.split() if out else (f"{target}:{w['name']}", f"{target}:{w['name']}.0")
+        session_exists = True
+        existing[w["name"]] = win_id
+        active_pane = pane_id if first_pane.get("active") else None
+        for pane in panes[1:]:
+            pane_id = do(["split-window", "-d", "-t", pane_id, "-c", pane["path"], "-h",
+                          "-P", "-F", "#{pane_id}"] + launch(pane), f"extra pane in {w['name']}")
+            pane_id = pane_id or f"{target}:{w['name']}.{pane.get('index', 0)}"
+            if pane.get("active"):
+                active_pane = pane_id
+        if active_pane:
+            do(["select-pane", "-t", active_pane], "restore active pane")
+
+    # re-select the originally active window
+    for w in windows:
+        if w.get("active"):
+            # only if it exists now
+            print(f"# originally active window: {w['name']}")
+            if not dry_run and w["name"] in existing:
+                run_tmux(["select-window", "-t", existing[w["name"]]], check=False)
+            break
+
+
+if __name__ == "__main__":
+    main()

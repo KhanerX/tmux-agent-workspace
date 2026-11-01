@@ -1,0 +1,12 @@
+# Runtime state is private; never commit real snapshots or transcripts.
+.tmux-ai-sessions.json*
+*.snapshot.json*
+*.jsonl
+*.log
+.env
+.env.*
+__pycache__/
+*.py[cod]
+node_modules/
+.venv/
+.DS_Store

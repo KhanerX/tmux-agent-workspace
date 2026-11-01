@@ -1,0 +1,25 @@
+#!/bin/sh
+
+# Agent hooks also run outside tmux; that should be a harmless no-op.
+[ -n "$TMUX" ] && [ -n "$TMUX_PANE" ] || exit 0
+
+case "$1" in
+  waiting)
+    # Several lifecycle events can describe the same completed turn.
+    [ "$(tmux show-option -wqv -t "$TMUX_PANE" @agent_waiting)" = "1" ] && exit 0
+
+    tmux set-option -w -t "$TMUX_PANE" @agent_waiting 1
+
+    window_name=$(tmux display-message -p -t "$TMUX_PANE" '#S:#I #W')
+    if command -v canberra-gtk-play >/dev/null 2>&1; then
+      canberra-gtk-play -i complete >/dev/null 2>&1 &
+    fi
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send --app-name='Terminal agent' --urgency=normal \
+        'Agent needs attention' "tmux window $window_name" >/dev/null 2>&1 &
+    fi
+    ;;
+  active)
+    tmux set-option -wu -t "$TMUX_PANE" @agent_waiting 2>/dev/null || true
+    ;;
+esac

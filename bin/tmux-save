@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""tmux-save: snapshot current tmux session windows + opencode/claude resume info.
+
+Read-only w.r.t. running panes (never sends keys). Writes JSON to
+~/.tmux-ai-sessions.json by default.
+Includes the current session's parking lot in parked_windows.
+
+Usage:
+  tmux-save [--session NAME] [--out PATH]
+
+Saved record per pane:
+  path, tool (opencode|claude|shell), ai_session (id or None), title
+"""
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import sys
+
+from tmux_ai import proc_args, proc_stat, recover_pane, resolve_claude, resolve_opencode
+from tmux_parking import parking_name
+
+DEFAULT_OUT = os.path.expanduser("~/.tmux-ai-sessions.json")
+
+# NOTE: tmux -F escapes non-printables (e.g. \x1f becomes literal \037),
+# so use a printable delimiter that won't appear in window/pane names.
+SEP = "@@@TMUX@@@"
+
+
+def run_tmux(args):
+    out = subprocess.run(
+        ["tmux"] + args, capture_output=True, text=True, check=False
+    )
+    if out.returncode != 0:
+        raise RuntimeError(f"tmux {' '.join(args)} failed: {out.stderr.strip()}")
+    return out.stdout
+
+
+def current_session():
+    return run_tmux(["display-message", "-p", "#S"]).strip()
+
+
+def list_windows(session):
+    fmt = SEP.join(["#{window_index}", "#{window_name}", "#{window_active}", "#{window_layout}"])
+    raw = run_tmux(["list-windows", "-t", session, "-F", fmt]).strip()
+    wins = []
+    if not raw:
+        return wins
+    for line in raw.splitlines():
+        parts = line.split(SEP)
+        if len(parts) != 4:
+            continue
+        idx, name, active, layout = parts
+        wins.append({
+            "index": int(idx),
+            "name": name,
+            "active": active == "1",
+            "layout": layout,
+        })
+    return wins
+
+
+def list_panes(session, window_index):
+    fmt = SEP.join([
+        "#{pane_index}", "#{pane_id}", "#{pane_title}",
+        "#{pane_current_command}", "#{pane_current_path}",
+        "#{pane_pid}", "#{pane_active}",
+    ])
+    raw = run_tmux(
+        ["list-panes", "-t", f"{session}:{window_index}", "-F", fmt]
+    ).strip()
+    panes = []
+    if not raw:
+        return panes
+    for line in raw.splitlines():
+        parts = line.split(SEP)
+        if len(parts) != 7:
+            continue
+        pidx, pid_, title, cmd, path, ppid, active = parts
+        panes.append({
+            "index": int(pidx),
+            "pane_id": pid_,
+            "title": title,
+            "cmd": cmd,
+            "path": path,
+            "pid": int(ppid) if ppid.isdigit() else None,
+            "active": active == "1",
+        })
+    return panes
+
+
+def proc_children(ppid):
+    """Return [(pid, basename_cmd)] for direct children of ppid (read-only /proc)."""
+    kids = []
+    if ppid is None:
+        return kids
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            fields = proc_stat(entry)
+            if len(fields) > 1 and int(fields[1]) == ppid:
+                args = proc_args(entry)
+                argv0 = args[0] if args else ""
+                # Claude can rewrite its process title. Prefer comm when known.
+                with open(f"/proc/{entry}/comm") as f:
+                    comm = f.read().strip()
+                base = comm if comm in ("opencode", "claude") else os.path.basename(argv0)
+                kids.append((int(entry), base, argv0))
+        except Exception:
+            continue
+    return kids
+
+
+def detect_tool(pane):
+    """Return (tool, tool_pid). tool in opencode|claude|shell."""
+    cmd_base = os.path.basename(pane["cmd"] or "")
+    if cmd_base in ("opencode", "claude"):
+        # find child pid with that binary; fall back to pane pid
+        for pid, base, _ in proc_children(pane["pid"]):
+            if base == cmd_base:
+                return cmd_base, pid
+        return cmd_base, pane["pid"]
+    # Follow wrappers (shell scripts, npm launchers) as well as direct children.
+    pending = [pane["pid"]]
+    seen = set()
+    while pending:
+        parent = pending.pop(0)
+        if parent in seen:
+            continue
+        seen.add(parent)
+        for pid, base, _ in proc_children(parent):
+            if base in ("opencode", "claude"):
+                return base, pid
+            pending.append(pid)
+    return "shell", pane["pid"]
+
+
+def main():
+    # Snapshots contain local paths, titles and conversation IDs. Keep them private.
+    os.umask(0o077)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--session", default=None, help="tmux session to save (default: current)")
+    ap.add_argument("--out", default=DEFAULT_OUT, help="output JSON path")
+    args = ap.parse_args()
+
+    try:
+        session = args.session or current_session()
+    except RuntimeError as e:
+        print(f"error: not inside tmux? {e}", file=sys.stderr)
+        sys.exit(1)
+
+    session = run_tmux(["display-message", "-p", "-t", session, "#{session_name}"]).strip()
+    wins = list_windows(session)
+    for w in wins:
+        w["source_session"] = session
+    lot = parking_name(session)
+    if subprocess.run(["tmux", "has-session", "-t", "=" + lot], capture_output=True).returncode == 0:
+        for w in list_windows("=" + lot):
+            w["source_session"] = "=" + lot
+            w["parked"] = True
+            wins.append(w)
+    out_windows = []
+    for w in wins:
+        panes = list_panes(w["source_session"], w["index"])
+        out_panes = []
+        for p in panes:
+            tool, tool_pid = detect_tool(p)
+            ai_session, method, db_title = None, None, None
+            if tool == "opencode":
+                ai_session, method, db_title = resolve_opencode(p["path"], p["title"], tool_pid)
+            elif tool == "claude":
+                ai_session, method = resolve_claude(tool_pid, p["path"], p["title"])
+            record = recover_pane({
+                "index": p["index"],
+                "active": p["active"],
+                "path": p["path"],
+                "tool": tool,
+                "ai_session": ai_session,
+                "method": method,
+                "pane_title": p["title"],
+                "db_title": db_title,
+            })
+            if record["tool"] in ("opencode", "claude") and not record["ai_session"]:
+                print(f"warn: {w['name']} pane{p['index']}: could not identify the {tool} session", file=sys.stderr)
+            out_panes.append(record)
+        out_windows.append({
+            "index": w["index"],
+            "name": w["name"],
+            "active": w["active"],
+            "layout": w["layout"],
+            "panes": out_panes,
+            "parked": w.get("parked", False),
+        })
+
+    payload = {
+        "saved_at": datetime.datetime.now().astimezone().isoformat(),
+        "tmux_session": session,
+        "windows": [w for w in out_windows if not w["parked"]],
+        "parked_windows": [w for w in out_windows if w["parked"]],
+    }
+    out_path = os.path.expanduser(args.out)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    if os.path.exists(out_path):
+        try:
+            os.replace(out_path, out_path + ".bak")
+        except Exception:
+            pass
+    with open(out_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"saved tmux session '{session}' ({len(out_windows)} windows) -> {out_path}")
+    for w in out_windows:
+        for p in w["panes"]:
+            print(f"  {'[parked] ' if w['parked'] else ''}win {w['index']}:{w['name']} pane{p['index']} "
+                  f"{p['tool']} dir={p['path']} session={p['ai_session']} ({p['method']})")
+
+
+if __name__ == "__main__":
+    main()

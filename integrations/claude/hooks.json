@@ -1,0 +1,33 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"$HOME/.local/bin/tmux-agent-status\" active" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"$HOME/.local/bin/tmux-agent-status\" waiting" }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"$HOME/.local/bin/tmux-agent-status\" waiting" }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "idle_prompt|agent_needs_input|agent_completed|permission_prompt",
+        "hooks": [
+          { "type": "command", "command": "\"$HOME/.local/bin/tmux-agent-status\" waiting" }
+        ]
+      }
+    ]
+  }
+}

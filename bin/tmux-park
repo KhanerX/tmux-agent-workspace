@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Park live windows; tmux-park menu opens the unpark picker."""
+import argparse
+import os
+import shlex
+import subprocess
+import sys
+
+from tmux_parking import parking_name
+
+
+def tmux(*args, check=True):
+    result = subprocess.run(["tmux", *args], capture_output=True, text=True)
+    if check and result.returncode:
+        raise RuntimeError(result.stderr.strip())
+    return result.stdout.strip()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", nargs="?", choices=["park", "menu", "unpark", "list"], default="park")
+    parser.add_argument("window", nargs="?")
+    parser.add_argument("--session")
+    args = parser.parse_args()
+    session = tmux("display-message", "-p", "-t", args.session or "", "#{session_name}")
+    if session.startswith("__parking_"):
+        raise RuntimeError("Run this from your main session, not its parking lot.")
+    lot = parking_name(session)
+    target = "=" + session
+    lot_target = "=" + lot
+    if args.action == "park":
+        window = args.window or tmux("display-message", "-p", "-t", target, "#{window_id}")
+        windows = tmux("list-windows", "-t", target, "-F", "#{window_id}").splitlines()
+        if window not in windows:
+            raise RuntimeError("Window does not belong to this session.")
+        # tmux needs one visible window to keep the main session alive.
+        if len(windows) == 1:
+            path = tmux("display-message", "-p", "-t", window, "#{pane_current_path}")
+            tmux("new-window", "-d", "-t", target + ":", "-c", path)
+        placeholder = None
+        if not tmux("list-windows", "-t", lot_target, "-F", "#{window_id}", check=False):
+            placeholder = tmux("new-session", "-d", "-s", lot, "-P", "-F", "#{window_id}")
+        tmux("move-window", "-d", "-s", window, "-t", lot_target + ":")
+        if placeholder:
+            tmux("kill-window", "-t", placeholder)
+        tmux("display-message", "Parked window. Prefix + p opens the parking lot.")
+    elif args.action == "unpark":
+        windows = tmux("list-windows", "-t", lot_target, "-F", "#{window_id}", check=False).splitlines()
+        if args.window not in windows:
+            raise RuntimeError("That window is no longer in this parking lot.")
+        tmux("move-window", "-s", args.window, "-t", target + ":")
+        tmux("select-window", "-t", args.window)
+    else:
+        rows = tmux("list-windows", "-t", lot_target, "-F", "#{window_id}\t#{window_name}", check=False).splitlines()
+        if args.action == "list":
+            print("\n".join(rows) if rows else "Parking lot is empty.")
+            return
+        if not rows:
+            tmux("display-message", "Parking lot is empty. Prefix + Shift-P parks a window.")
+            return
+        menu = ["display-menu", "-T", "Parking lot — select to unpark (Esc closes)", "-x", "C", "-y", "S"]
+        for i, row in enumerate(rows):
+            wid, name = row.split("\t", 1)
+            key = "1234567890abcdefghijklmnopqrstuvwxyz"[i] if i < 36 else ""
+            command = shlex.join([os.path.abspath(__file__), "unpark", wid, "--session", session])
+            # Labels are tmux formats; render literal '#' safely.
+            menu.extend([" " + name.replace("#", "##"), key, "run-shell " + shlex.quote(command)])
+        tmux(*menu)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except RuntimeError as exc:
+        print(f"tmux-park: {exc}", file=sys.stderr)
+        tmux("display-message", f"Parking lot: {exc}", check=False)
+        sys.exit(1)
