@@ -1,0 +1,100 @@
+#!/bin/sh
+set -eu
+
+. "$HOME/.config/theme/palette.conf"
+case "${1-}" in
+  dark|light) mode=$1 ;;
+  *) echo 'Usage: apply-unified-theme light|dark' >&2; exit 2 ;;
+esac
+
+if [ "$mode" = dark ]; then
+  bg=$DARK_BG; panel=$DARK_PANEL; text=$DARK_TEXT; muted=$DARK_MUTED
+  cyan=$CYAN; purple=$PURPLE; pink=$PINK; green=$GREEN; yellow=$YELLOW
+else
+  bg=$LIGHT_BG; panel=$LIGHT_PANEL; text=$LIGHT_TEXT; muted=$LIGHT_MUTED
+  cyan=$LIGHT_CYAN; purple=$LIGHT_PURPLE; pink=$LIGHT_PINK; green=$LIGHT_GREEN; yellow=$LIGHT_YELLOW
+fi
+
+cat >"$HOME/.config/i3/theme.conf" <<EOF
+bar {
+    font pango:DejaVu Sans Mono 9
+    height 22
+    status_command python3 "\$HOME/.config/i3/ai-usage-status.py"
+    colors {
+        background $bg
+        statusline $text
+        separator $purple
+        focused_workspace $cyan $panel $text
+        active_workspace $purple $panel $text
+        inactive_workspace $panel $bg $muted
+        urgent_workspace $pink $pink $DARK_TEXT
+    }
+}
+EOF
+
+cat >"$HOME/.config/i3status/config" <<EOF
+general {
+    output_format = "i3bar"
+    colors = true
+    interval = 5
+    color_good = "$green"
+    color_degraded = "$yellow"
+    color_bad = "$pink"
+}
+
+order += "battery all"
+order += "ethernet _first_"
+order += "disk /"
+order += "load"
+order += "memory"
+order += "tztime local"
+
+battery all {
+    format = "BAT %status %percentage %remaining"
+}
+ethernet _first_ {
+    format_up = "NET %ip"
+    format_down = "NET --"
+}
+disk "/" {
+    format = "SSD %avail"
+}
+load {
+    format = "CPU %1min"
+}
+memory {
+    format = "RAM %used"
+    threshold_degraded = "1G"
+}
+tztime local {
+    format = "%a %Y-%m-%d %H:%M"
+}
+EOF
+
+cat >"$HOME/.config/kitty/current-theme.conf" <<EOF
+foreground $text
+background $bg
+selection_foreground $text
+selection_background $purple
+cursor $cyan
+cursor_text_color $bg
+active_border_color $cyan
+inactive_border_color $muted
+color0 $bg
+color1 $pink
+color2 $green
+color3 $yellow
+color4 $cyan
+color5 $purple
+color6 $cyan
+color7 $text
+color8 $muted
+color9 $pink
+color10 $green
+color11 $yellow
+color12 $cyan
+color13 $purple
+color14 $cyan
+color15 $text
+EOF
+if [ -n "${DISPLAY:-}" ]; then i3-msg reload; fi

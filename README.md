@@ -43,6 +43,10 @@ may support the config and parking, but are not tested; AI lookup is Linux-only.
 
 ## Install
 
+**Setting up an Ubuntu laptop with i3?** The [desktop setup guide](desktop/README.md)
+installs the desktop packages and uses `sh install.sh --desktop` to restore i3,
+Kitty, the keyboard layout, status bar, eye-break reminders, and this tmux setup.
+
 ```sh
 git clone https://github.com/KhanerX/tmux-agent-workspace.git
 cd tmux-agent-workspace

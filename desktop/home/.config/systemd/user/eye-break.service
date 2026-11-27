@@ -1,0 +1,12 @@
+[Unit]
+Description=Translucent i3 eye-rest reminder
+PartOf=graphical-session.target
+After=graphical-session.target
+Wants=picom.service
+After=picom.service
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/python3 %h/.local/share/eye-break/eye_break.py
+Restart=on-failure
+RestartSec=5
