@@ -1,0 +1,12 @@
+[Unit]
+Description=Picom compositor for the i3 session
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/picom --config %h/.config/picom.conf
+ExecStartPost=/usr/bin/python3 %h/.local/share/eye-break/wait_for_compositor.py
+Restart=always
+RestartSec=2
+TimeoutStartSec=20

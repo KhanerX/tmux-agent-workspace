@@ -3,10 +3,12 @@
 set -eu
 
 with_config=false
+desktop=false
 case "${1-}" in
   '') ;;
   --with-tmux-config) with_config=true ;;
-  *) echo "Usage: sh install.sh [--with-tmux-config]" >&2; exit 2 ;;
+  --desktop) desktop=true; with_config=true ;;
+  *) echo "Usage: sh install.sh [--with-tmux-config | --desktop]" >&2; exit 2 ;;
 esac
 [ "$#" -le 1 ] || { echo 'Too many arguments' >&2; exit 2; }
 
@@ -14,11 +16,12 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 backup=$(date +%Y%m%d-%H%M%S)-$$
 install_file() {
   source=$1 destination=$2 mode=$3
+  if [ -d "$destination" ]; then
+    echo "Expected a file, found a directory: $destination" >&2; exit 1
+  fi
   if [ -e "$destination" ] || [ -L "$destination" ]; then
-    cp -p -- "$destination" "$destination.backup-$backup"
+    mv -- "$destination" "$destination.backup-$backup"
     echo "Backed up $destination -> $destination.backup-$backup"
-    # Replace a symlink itself instead of writing through to its target.
-    rm -- "$destination"
   fi
   install -m "$mode" -- "$source" "$destination"
   echo "Installed $destination"
@@ -34,5 +37,14 @@ done
 install_file "$root/bin/tmux-agent-status" "$HOME/.local/bin/tmux-agent-status" 755
 if "$with_config"; then
   install_file "$root/config/tmux.conf" "$HOME/.tmux.conf" 644
+fi
+if "$desktop"; then
+  while IFS= read -r file; do
+    mkdir -p -- "$(dirname -- "$HOME/$file")"
+    mode=644
+    case "$file" in .local/bin/*) mode=755 ;; esac
+    install_file "$root/desktop/home/$file" "$HOME/$file" "$mode"
+  done < "$root/desktop/files.txt"
+  echo 'Desktop installed. See desktop/README.md for first login and per-laptop settings.'
 fi
 echo 'Done. Add ~/bin and ~/.local/bin to PATH; see README.md for config and agent hooks.'

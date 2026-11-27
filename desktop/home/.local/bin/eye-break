@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+case "${1:-status}" in
+    start|restart)
+        systemctl --user import-environment DISPLAY XAUTHORITY
+        systemctl --user "${1}" eye-break.service
+        ;;
+    stop|status)
+        systemctl --user "${1}" eye-break.service
+        ;;
+    now)
+        "$0" start
+        systemctl --user kill --kill-whom=main --signal=SIGUSR1 eye-break.service
+        ;;
+    dismiss)
+        systemctl --user kill --kill-whom=main --signal=SIGUSR2 eye-break.service
+        ;;
+    battery-test)
+        "$0" start
+        systemctl --user kill --kill-whom=main --signal=SIGHUP eye-break.service
+        ;;
+    preview)
+        exec /usr/bin/python3 "$HOME/.local/share/eye-break/eye_break.py" --preview
+        ;;
+    *)
+        printf '%s\n' 'Usage: eye-break {start|stop|restart|status|now|dismiss|preview|battery-test}'
+        exit 2
+        ;;
+esac
